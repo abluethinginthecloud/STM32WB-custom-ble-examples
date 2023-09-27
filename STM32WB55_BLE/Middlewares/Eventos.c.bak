@@ -1,0 +1,562 @@
+/*!@file Eventos.c
+ * @brief Este fichero implementa las funciones necesarias para gestionar la
+ * escritura y lectura en memoria flash de los eventos de alarmas y fichajes
+ *
+ * @author A BLUE THING IN THE CLOUD S.L.U.
+ *    ===  When the technology becomes art ===
+ *
+ * www.abluethinginthecloud.com
+ * j.longares@abluethinginthecloud
+ *
+ * (c) A BLUE THING IN THE CLOUD S.L.U.
+ *
+ *
+        ██████████████    ██    ██    ██  ██████    ██████████████
+        ██          ██      ████████████████  ██    ██          ██
+        ██  ██████  ██  ██████  ██    ██        ██  ██  ██████  ██
+        ██  ██████  ██    ██████    ██      ██      ██  ██████  ██
+        ██  ██████  ██      ██      ████  ██████    ██  ██████  ██
+        ██          ██    ██      ██████    ████    ██          ██
+        ██████████████  ██  ██  ██  ██  ██  ██  ██  ██████████████
+                        ██████  ████  ██████  ████
+        ██████  ██████████  ████    ████████      ████      ██
+        ██  ████  ██    ██  ████        ████    ████████  ██    ██
+            ██  ██  ████  ██      ██      ██      ██  ████  ██████
+        ████  ████    ██      ██          ████  ██  ██        ██
+            ██████████          ██      ██    ██  ████    ██  ████
+          ██  ████    ██      ██████    ██  ██████████    ██    ██
+        ██  ████  ████████████████  ██    ██        ████████  ████
+                ████        ██  ██████  ██████████      ████  ██
+        ██████  ████████████████    ████  ██    ██████    ██  ████
+            ████████  ██████  ██    ██████      ██        ████  ██
+        ██    ██  ████████  ██    ██        ██    ██          ████
+          ████  ████          ██      ████████████  ██  ████  ██
+        ██  ██████  ████  ██    ██      ████    ██████████
+                        ██    ██████    ██      ██      ██  ██████
+        ██████████████  ██  ██████  ██  ████  ████  ██  ████  ████
+        ██          ██  ██      ████████  ██    ██      ████  ████
+        ██  ██████  ██  ████  ██    ██████      ██████████    ████
+        ██  ██████  ██    ██████    ██  ██  ████      ████  ██████
+        ██  ██████  ██  ████      ██    ████  ██        ████    ██
+        ██          ██  ██    ██      ██████████████  ██      ██
+        ██████████████  ██████  ██        ██  ████    ██████  ████
+ */
+
+#include "Eventos.h"
+
+#include "Tarea_Eventos.h"
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include "cmsis_os.h"
+#include "flash.h"
+#include "Interprete.h"
+#include "Tarea_Consola.h"
+#include "Tarea_RTC.h"
+
+//! Posicion en el buffer almacenado en flash del evento alarma con el tipo
+#define POSICION_TIPO_ALARMA													3
+//! Tamaño de las tramas enviadas al interprete con la informacion de los en-
+//! víos síncronos de alarmas
+#define EVENTOS_TAMANO_INFO_SINCRONO_ALARMAS									17
+//! víos síncronos de alarmas
+#define EVENTOS_TAMANO_INFO_SINCRONO_FICHAJES									100
+
+
+//! Buffer para guardar los datos leidos de la flash
+static uint8_t eventosRxBuffer[100];
+//! Buffer para guardar los datos a escribir en la flash
+static uint8_t eventosTxBuffer[100];
+//! Esta variable guarda el numero de nodos en el buffer circular de fichajes
+static uint16_t numeroDeNodos = 0;
+//! Esta variable guarda el indice del siguiente nodo en el buffer donde
+//! escribiremos los fichajes
+static uint16_t indiceBuffer = 0;
+//! Buffer para almacenar el síncrono recibido
+static uint8_t sincronoProcesado [ INTERPRETE_TAM_MAX_RESPUESTA ];
+//! Parámetros para enviar por la consola
+static tParametrosCola parametrosColaEventosAlarma;
+//! Buffer con la trama enviada con la información del evento síncrono alarmas
+static uint8_t infoSincronoAlarmas [ EVENTOS_TAMANO_INFO_SINCRONO_ALARMAS ];
+//! Buffer con la trama enviada con la información del evento síncrono fichajes
+static uint8_t infoSincronoFichajes [ EVENTOS_TAMANO_INFO_SINCRONO_FICHAJES ];
+//! Variable para almacenar el número de fichajes pendientes de enviar
+static uint8_t fichajesPendientes = 0;
+//! Comando GET
+static uint8_t comandoGet [7]= {0x02, 0x07, 0x00, 0x64, 0x00, 0x03, 0x00};
+//! Buffer para almacenar las respuestas del intérprete
+static uint8_t respuestaInterprete [ INTERPRETE_TAM_MAX_RESPUESTA ];
+//! Parámetros para enviar por la consola
+static tParametrosCola parametrosColaEventosPeriodicos;
+//! Estado del envío períodico de eventos
+tEstadoEnvioPeriodico estado = EVENTOS_ESTADO_INICIAL;
+
+
+/*! Esta función escribe una alarma en su posición correspondiente de la flash
+ *
+ */
+void Eventos_Guardar_Alarma_En_Historico ( tTipoEventoAlarma tipoEvento, 	 \
+										   uint8_t *alarma ){
+	int8_t flashEstado = -1;
+	uint8_t cont = 0;
+
+	memset(eventosTxBuffer, 0 , FLASH_TAMANO_EVENTOS_ALARMA);
+	flashEstado = -1;
+
+	memcpy(eventosTxBuffer, 												\
+		   alarma, 								\
+		   FLASH_TAMANO_EVENTOS_ALARMA);
+
+	if( tipoEvento < EVENTO_ALARMA_MAX_EVENTOS ){
+		while ( (flashEstado == -1) && 										\
+			    (cont < FLASH_NUMERO_MAXIMO_INTENTOS_ESCRITURA) ){
+
+			flashEstado = Flash_Escribir_Historico_Alarmas(eventosTxBuffer, \
+											   FLASH_TAMANO_EVENTOS_ALARMA, \
+											   tipoEvento);
+			cont ++;
+		}
+	}
+
+    // Leer el espontaneo que se ha añadido en la flash como comprobación
+    memset(eventosRxBuffer, 0, 100);
+    Flash_Leer_Historico_Alarmas(eventosRxBuffer,                                                 \
+                    FLASH_TAMANO_EVENTOS_ALARMA, tipoEvento);
+}
+
+/*! Función para enviar un evento de alarma encolado en la flash
+ * param[in] evento Puntero a la direccion con el tipo de evento alarma que se quiere enviar
+ * param[out] pDatosMensAlarma Puntero al buffer de salida con el contenido a enviar
+ * @return 1 en caso correcto, 0 en caso de error
+ */
+uint8_t Eventos_Enviar_Alarma_Desde_Flash( tTipoEventoAlarma *evento, uint8_t *pDatosMensAlarma ){
+
+	uint8_t nDatosRespuesta;
+	uint16_t alarmasEnFlash;
+
+	alarmasEnFlash = Eventos_Comprobar_Alarmas_Flash();
+
+	if(alarmasEnFlash == 0){
+		return 0;
+	}
+
+	while( ((alarmasEnFlash >> *evento) & 0x01) != 0x01 ){
+		*evento = *evento + 1;
+		if ( *evento >= EVENTO_ALARMA_MAX_EVENTOS ){
+			return 0;
+		}
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 *evento);												\
+
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == *evento + 1 ){
+		memcpy( pDatosMensAlarma, 									\
+				eventosRxBuffer, 											\
+				FLASH_TAMANO_EVENTOS_ALARMA);
+		return 1;
+	}
+
+	return 0;
+}
+
+/*! Esta función devuelve como máscara de bits los tipos de alarma que hay
+ * guardados en la flash
+ */
+uint16_t Eventos_Comprobar_Alarmas_Flash(void){
+	uint16_t mascaraAlarmasGuardadas = 0;
+	uint16_t numeroAlarmasGuardadas = 0;
+	int8_t flashEstado = -1;
+	uint8_t cont;
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_BATERIA_BAJA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 1){
+		mascaraAlarmasGuardadas |= 0x01;
+		numeroAlarmasGuardadas ++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_BATERIA_CRITICA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 2){
+		mascaraAlarmasGuardadas |= 0x02;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_CAMBIO_BATERIA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 3){
+		mascaraAlarmasGuardadas |= 0x04;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_TEMPERATURA_ALTA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 4){
+		mascaraAlarmasGuardadas |= 0x08;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_VACIADO_CUBO);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 5){
+		mascaraAlarmasGuardadas |= 0x010;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_DIAGNOSTICO);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 6){
+		mascaraAlarmasGuardadas |= 0x20;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_PUERTA_ABIERTA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 7){
+		mascaraAlarmasGuardadas |= 0x40;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_PUERTA_VIOLENTADA);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 8){
+		mascaraAlarmasGuardadas |= 0x80;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Alarmas(eventosRxBuffer, 							\
+					 FLASH_TAMANO_EVENTOS_ALARMA, 							\
+					 EVENTO_ALARMA_VANDALISMO);
+	if(eventosRxBuffer[ POSICION_TIPO_ALARMA ] == 9){
+		mascaraAlarmasGuardadas |= 0x100;
+		numeroAlarmasGuardadas++;
+	}
+
+	memset(eventosTxBuffer, 0 , FLASH_TAMANO_NUMERO_ALARMAS_GUARDADAS);
+	flashEstado = -1;
+	cont = 0;
+	Herramientas_Serializar(eventosTxBuffer, numeroAlarmasGuardadas, 0);
+
+	while ( (flashEstado == -1) && 											\
+			(cont < FLASH_NUMERO_MAXIMO_INTENTOS_ESCRITURA) ){
+
+		flashEstado = Flash_Escribir_Numero_Alarmas_Guardadas(eventosTxBuffer, 	\
+				FLASH_TAMANO_NUMERO_ALARMAS_GUARDADAS);
+		cont ++;
+	}
+
+	return mascaraAlarmasGuardadas;
+}
+
+
+/*! Esta funcion es usada para inicializar el buffer circular,
+ *  dado el numero de entradas
+ */
+void Eventos_Inicializar_Buffer_Circular( void )
+{
+    indiceBuffer = 0;
+    numeroDeNodos = 0;
+}
+
+
+/*! Esta funcion se usa para añadir nuevos nodos con el dato dado al buffer
+ * circular.
+ * Si el buffer circular no puede añadir nuevos nodos (por ejemplo, el numero
+ * maximo
+ * de nodos ya estan en el buffer), entonces solo actualizara el valor del
+ * nodo siguiente.
+ * @param[in] pDato Puntero al dato que sera añadido al nuevo nodo.
+ * @return Devuelve 1 cuando tiene exito, 0 cuando da error
+ */
+uint8_t Eventos_Nuevo_Nodo_Buffer_Circular( uint8_t *fichaje )
+{
+	int8_t flashEstado = -1;
+	uint8_t cont = 0;
+
+	if( NULL == fichaje ){
+		return 0;
+	}
+
+	if( ( indiceBuffer >= TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ) || 		\
+	( numeroDeNodos > TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ) ){
+		/* Chequeo de sanidad. Esto nunca deberia pasar */
+		Eventos_Inicializar_Buffer_Circular();
+		fichajesPendientes = 0;
+	}
+
+	memset(eventosTxBuffer, 0 , FLASH_TAMANO_EVENTOS_FICHAJE);
+	flashEstado = -1;
+	memcpy(eventosTxBuffer, 												\
+		   fichaje, 								\
+		   FLASH_TAMANO_EVENTOS_FICHAJE);
+
+	while ( (flashEstado == -1) && 											\
+			(cont < FLASH_NUMERO_MAXIMO_INTENTOS_ESCRITURA) ){
+
+		flashEstado = Flash_Escribir_Historico_Fichajes(eventosTxBuffer, 	\
+					  FLASH_TAMANO_EVENTOS_FICHAJE, indiceBuffer);
+		cont ++;
+	}
+
+	memset(eventosRxBuffer, 0, 100);
+	Flash_Leer_Historico_Fichajes(eventosRxBuffer, 						\
+			FLASH_TAMANO_EVENTOS_FICHAJE, indiceBuffer);
+
+	fichajesPendientes++;
+	indiceBuffer++;
+
+	if( indiceBuffer >= TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ){
+		indiceBuffer = 0;
+	}
+	if( numeroDeNodos < TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ){
+		numeroDeNodos++;
+	}
+
+	memset(eventosTxBuffer, 0 , FLASH_TAMANO_NUMERO_FICHAJES_GUARDADOS);
+	flashEstado = -1;
+	cont = 0;
+	Herramientas_Serializar(eventosTxBuffer, numeroDeNodos, 0);
+
+	while ( (flashEstado == -1) && 											\
+			(cont < FLASH_NUMERO_MAXIMO_INTENTOS_ESCRITURA) ){
+
+		flashEstado = Flash_Escribir_Numero_Fichajes_Guardados(eventosTxBuffer, 	\
+				FLASH_TAMANO_NUMERO_FICHAJES_GUARDADOS);
+		cont ++;
+	}
+
+	return 1;
+}
+
+/*! Esta funcion devuelve el numero de nodos en un buffer circular
+* @return Numero de entradas en el buffer circular
+*/
+uint16_t Eventos_Numero_de_Nodos_Buffer_Circular( void )
+{
+	return numeroDeNodos;
+
+}
+
+/*! Esta funcion devuelve el índice del buffer circular
+* @returnÍndice del buffer circular
+*/
+uint16_t Eventos_Indice_Buffer_Circular( void )
+{
+	return indiceBuffer;
+
+}
+
+/*! Esta funcion devuelve el numero de fichajes pendientes de enviar
+* @return Numero de entradas en el buffer circular
+*/
+uint16_t Eventos_Numero_de_Fichajes_Pendientes_Buffer_Circular( void )
+{
+	return fichajesPendientes;
+
+}
+
+
+/*! Esta funcion se usa para obtener un nodo de una posicion dada y guardarla
+ *  en eventosRxBuffer
+ * @param[in] posicion Posicion del nodo
+ *  en el buffer circular.
+ * @return Devuelve 1 cuando tiene exito, 0 cuando da error.
+ */
+uint8_t Eventos_Obtener_Nodo_Buffer_Circular( uint32_t posicion )
+{
+	if( TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR < numeroDeNodos ){
+		// Caso de error. No debería ocurrir
+		// Inicializar las variables en flash
+		Eventos_Inicializar_Buffer_Circular();
+		 return 0;
+	}
+	else{
+		if( numeroDeNodos < TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ){
+			memset(eventosRxBuffer, 0, 100);
+			Flash_Leer_Historico_Fichajes(eventosRxBuffer, 						\
+					FLASH_TAMANO_EVENTOS_FICHAJE, posicion);
+		}
+		else{
+			int i;
+			int indiceAObtener = indiceBuffer;
+			for( i = 0; i < posicion; i++ ){
+				indiceAObtener++;
+				if( indiceAObtener == TAMANO_DE_EVENTOS_DEL_BUFFER_CIRCULAR ){
+					indiceAObtener = 0;
+				}
+			}
+			memset(eventosRxBuffer, 0, 100);
+			Flash_Leer_Historico_Fichajes(eventosRxBuffer, 					\
+					FLASH_TAMANO_EVENTOS_FICHAJE, indiceAObtener);
+		}
+	}
+          return 1;
+
+}
+
+// Cada fichaje en flash: DateTime + IdTar + InfoTar
+/*! Función para enviar eventos de fichaje encolados en la flash
+ * param[in] periferico Tipo de periférico por el cual se hace el envío
+ * param[out] pDatosMensFichajes Puntero al buffer de salida con el contenido a enviar
+ * param[out] nNDatosMensFichajes Tamaño del mensaje contenido en el buffer de salida
+ * @return 1 en caso correcto, 0 en caso de error
+ */
+uint8_t Eventos_Enviar_Fichajes_Desde_Flash( tTipoPeriferico periferico, uint8_t *pDatosMensFichajes, uint8_t *pNDatosMensFichaje ){
+
+	uint8_t eventosMaximosMensaje;
+	uint8_t longitudComando;
+	uint8_t nDatosRespuesta;
+	uint8_t posicionInicial;
+	uint8_t posicionFinal;
+	uint8_t contador;
+
+	memset(sincronoProcesado, 0 , INTERPRETE_TAM_MAX_RESPUESTA);
+
+	if(periferico == EVENTOS_PERIFERICO_MODEM){
+		eventosMaximosMensaje = 10;
+	}
+	else if(periferico == EVENTOS_PERIFERICO_CONSOLA){
+		eventosMaximosMensaje = 6;
+	}
+	else{
+		return 0;
+	}
+
+
+	if(fichajesPendientes > eventosMaximosMensaje){
+		*sincronoProcesado = eventosMaximosMensaje;
+		posicionFinal = indiceBuffer - (fichajesPendientes - eventosMaximosMensaje);
+	}
+	else{
+		*sincronoProcesado = fichajesPendientes;
+		posicionFinal = indiceBuffer;
+	}
+
+	posicionInicial = indiceBuffer - fichajesPendientes;
+
+	contador = 0;
+	for(int i = posicionInicial; i < posicionFinal; i ++){
+		memset(eventosRxBuffer, 0 , FLASH_TAMANO_EVENTOS_FICHAJE);
+		Eventos_Obtener_Nodo_Buffer_Circular(i);
+		memcpy(sincronoProcesado + 3 + contador*FLASH_TAMANO_EVENTOS_FICHAJE,	\
+			   eventosRxBuffer, 											\
+			   FLASH_TAMANO_EVENTOS_FICHAJE);
+		contador ++;
+	}
+
+	Herramientas_Serializar(sincronoProcesado + 1, posicionFinal, 0);
+
+	if (fichajesPendientes > eventosMaximosMensaje){
+		fichajesPendientes -= eventosMaximosMensaje;
+	}
+
+	else{
+		fichajesPendientes = 0;
+	}
+
+	*pNDatosMensFichaje = 3 + (*sincronoProcesado * FLASH_TAMANO_EVENTOS_FICHAJE);
+
+	memcpy( pDatosMensFichajes, 									\
+			sincronoProcesado, 											\
+			*pNDatosMensFichaje);
+
+	return 1;
+}
+
+/* Función para enviar los eventos síncronos. Tras ESP_ID_ST (estado), se
+ * envía ESP_ID_ALR (alarmas) y ESP_ID_TAR (fichajes)
+ *
+ * @return 1 si se ejecuta correctamente, 0 en caso de error
+ */
+void Eventos_Enviar_Espontaneos_Periodicamente( void )
+{
+	uint8_t nDatosRespuesta;
+	tInterpreteError errorInterprete;
+	memset(respuestaInterprete, 0, INTERPRETE_TAM_MAX_RESPUESTA);
+	switch(estado){
+		case EVENTOS_ESTADO_INICIAL:
+			if (Tarea_RTC_Estado_Alarma() == 1){
+				Eventos_Cambiar_Estado(EVENTOS_ESTADO_ENVIANDO_ID_ST);
+			}
+		break;
+
+		case EVENTOS_ESTADO_ENVIANDO_ID_ST:
+			// Enviar comando para obtener ESP_ID_ST
+			comandoGet[4] = 0x01;
+			Interprete_Comandos ( (uint8_t *)comandoGet, 														\
+									7, 																			\
+									respuestaInterprete,														\
+									&nDatosRespuesta );
+			parametrosColaEventosPeriodicos.pTrazaCola = respuestaInterprete;
+			parametrosColaEventosPeriodicos.longitudTrazaCola = nDatosRespuesta;
+			Tarea_Consola_Enviar_Traza(&parametrosColaEventosPeriodicos);
+			Eventos_Cambiar_Estado(EVENTOS_ESTADO_INICIO_ENVÍO_ESP_ALR);
+		break;
+
+		case EVENTOS_ESTADO_INICIO_ENVÍO_ESP_ALR:
+		// Enviar comando para obtener ESP_ID_ALR
+		comandoGet[4] = 0x02;
+		errorInterprete = Interprete_Comandos ( (uint8_t *)comandoGet, 														\
+								7, 																			\
+								respuestaInterprete,														\
+								&nDatosRespuesta );
+		Eventos_Cambiar_Estado(EVENTOS_ESTADO_ENVIANDO_ESP_ALR);
+		break;
+
+		case EVENTOS_ESTADO_ENVIANDO_ESP_ALR:
+			// Esperando a que se cambie el estado desde el Intérprete cuando
+			//llegue el fin de cola
+		break;
+
+		case EVENTOS_ESTADO_INICIO_ENVÍO_ESP_TAR:
+		// Enviar comando para obtener ESP_ID_TAR
+		comandoGet[4] = 0x03;
+		errorInterprete = Interprete_Comandos ( (uint8_t *)comandoGet, 														\
+								7, 																			\
+								respuestaInterprete,														\
+								&nDatosRespuesta );
+		Eventos_Cambiar_Estado(EVENTOS_ESTADO_ENVIANDO_ESP_TAR);
+		break;
+
+		case EVENTOS_ESTADO_ENVIANDO_ESP_TAR:
+			// Esperando a que se cambie el estado desde el Intérprete cuando
+			//llegue el fin de cola
+		break;
+
+	}
+}
+
+/*! Función para cambiar de estado
+ *
+ */
+void Eventos_Cambiar_Estado (tEstadoEnvioPeriodico estadoNuevo){
+	estado = estadoNuevo;
+}
+
+/*! Función para obtener el estado desde otras tareas
+ *
+ */
+tEstadoEnvioPeriodico Eventos_Obtener_Estado ( void ){
+	return estado;
+}
+
